@@ -7,16 +7,32 @@ static view notes. It never talks to Vocci and never decides what a
 project or priority is -- the calling agent extracts that from the
 transcript and hands it in as one JSON payload per session.
 
+Two backends, same commands and payload shape either way:
+  --backend fs   (default) writes directly to a vault folder on this
+                 machine. Requires --vault PATH.
+  --backend rest writes over the Obsidian "Local REST API" community
+                 plugin's HTTP API, so this script can run on a different
+                 machine than the vault (e.g. a remote/cloud Claude
+                 session). Requires OBSIDIAN_REST_URL and
+                 OBSIDIAN_REST_API_KEY (env vars, or --api-url/--api-key).
+
 Subcommands:
-  setup        --vault PATH
-  sync-entry   --vault PATH --payload FILE [--force]
-  rebuild-views --vault PATH
-  status       --vault PATH
+  check         -- verify the backend is reachable (run this first when
+                    setting up --backend rest, before anything else)
+  setup         -- scaffold folders (fs) / verify + init state (rest)
+  sync-entry    --payload FILE [--force]
+  rebuild-views
+  status
 """
 import argparse
 import json
+import os
 import re
+import ssl
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -35,30 +51,152 @@ def sanitize(name: str, maxlen: int = 80) -> str:
     return name[:maxlen].rstrip()
 
 
-def unique_path(dir_path: Path, stem: str, ext: str = ".md") -> Path:
-    candidate = dir_path / f"{stem}{ext}"
-    if not candidate.exists():
-        return candidate
-    n = 2
-    while (dir_path / f"{stem} ({n}){ext}").exists():
-        n += 1
-    return dir_path / f"{stem} ({n}){ext}"
+def stem_of(rel_path: str) -> str:
+    name = rel_path.rsplit("/", 1)[-1]
+    return name[:-3] if name.endswith(".md") else name
 
 
-def load_state(vault: Path) -> dict:
-    p = vault / STATE_DIR / STATE_FILE
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {"sessions": {}}
+# ---------------------------------------------------------------- backends
+
+class FsBackend:
+    """Direct filesystem access to a vault folder on this machine."""
+
+    def __init__(self, root: Path):
+        self.root = root
+
+    def check(self):
+        return (True, "ok") if self.root.is_dir() else (False, f"vault path does not exist or is not a directory: {self.root}")
+
+    def exists(self, rel_path: str) -> bool:
+        return (self.root / rel_path).exists()
+
+    def read_text(self, rel_path: str):
+        p = self.root / rel_path
+        return p.read_text(encoding="utf-8") if p.exists() else None
+
+    def write_text(self, rel_path: str, content: str) -> None:
+        p = self.root / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    def delete(self, rel_path: str) -> None:
+        p = self.root / rel_path
+        if p.exists():
+            p.unlink()
+
+    def list_md(self, rel_dir: str):
+        d = self.root / rel_dir
+        if not d.is_dir():
+            return []
+        return sorted(f"{rel_dir}/{p.name}" for p in d.glob("*.md"))
+
+    def ensure_dirs(self, folders) -> None:
+        for f in folders:
+            (self.root / f).mkdir(parents=True, exist_ok=True)
 
 
-def save_state(vault: Path, state: dict) -> None:
-    d = vault / STATE_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    (d / STATE_FILE).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+class RestBackend:
+    """Obsidian 'Local REST API' community plugin, over HTTP(S).
+
+    Talks to the plugin's stable core endpoints only: GET/PUT/DELETE on
+    /vault/{path}, and GET on /vault/{dir}/ for a directory listing. The
+    plugin creates any missing parent folders automatically on PUT, the
+    same way saving a new note from inside Obsidian would.
+
+    Verify with `check` once against your actual plugin install before a
+    real sync -- community-plugin APIs can shift between versions.
+    """
+
+    def __init__(self, base_url: str, api_key: str, insecure: bool = False):
+        self.base = base_url.rstrip("/")
+        self.api_key = api_key
+        self.ctx = ssl._create_unverified_context() if insecure else None
+
+    def _request(self, method: str, url: str, data=None, accept="text/markdown"):
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        if accept:
+            headers["Accept"] = accept
+        body = None
+        if data is not None:
+            headers["Content-Type"] = "text/markdown; charset=utf-8"
+            body = data.encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=30) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", errors="replace")
+        except urllib.error.URLError as e:
+            sys.exit(f"error: could not reach {self.base} ({e.reason}). Is the tunnel/plugin up? Run `check` to diagnose.")
+
+    def _vault_url(self, rel_path: str) -> str:
+        return f"{self.base}/vault/{urllib.parse.quote(rel_path, safe='/')}"
+
+    def check(self):
+        status, body = self._request("GET", f"{self.base}/", accept="application/json")
+        if status == 200:
+            return True, "ok"
+        if status in (401, 403):
+            return False, f"authentication failed ({status}) -- check OBSIDIAN_REST_API_KEY"
+        return False, f"unexpected response ({status}): {body[:200]}"
+
+    def exists(self, rel_path: str) -> bool:
+        status, _ = self._request("GET", self._vault_url(rel_path))
+        return status == 200
+
+    def read_text(self, rel_path: str):
+        status, body = self._request("GET", self._vault_url(rel_path))
+        if status == 404:
+            return None
+        if status != 200:
+            sys.exit(f"error: GET {rel_path} failed ({status}): {body[:300]}")
+        return body
+
+    def write_text(self, rel_path: str, content: str) -> None:
+        status, body = self._request("PUT", self._vault_url(rel_path), data=content)
+        if status not in (200, 201, 204):
+            sys.exit(f"error: PUT {rel_path} failed ({status}): {body[:300]}")
+
+    def delete(self, rel_path: str) -> None:
+        status, body = self._request("DELETE", self._vault_url(rel_path))
+        if status not in (200, 204, 404):
+            sys.exit(f"error: DELETE {rel_path} failed ({status}): {body[:300]}")
+
+    def list_md(self, rel_dir: str):
+        status, body = self._request("GET", self._vault_url(rel_dir.rstrip("/") + "/"), accept="application/json")
+        if status == 404:
+            return []
+        if status != 200:
+            sys.exit(f"error: listing {rel_dir} failed ({status}): {body[:300]}")
+        try:
+            names = json.loads(body).get("files", [])
+        except json.JSONDecodeError:
+            sys.exit(f"error: listing {rel_dir} returned non-JSON body -- unexpected plugin response: {body[:300]}")
+        return [f"{rel_dir.rstrip('/')}/{n}" for n in names if n.endswith(".md")]
+
+    def ensure_dirs(self, folders) -> None:
+        pass  # the plugin creates folders implicitly on first write into them
 
 
-def write_note(path: Path, frontmatter: dict, body: str) -> None:
+def make_backend(args):
+    if args.backend == "rest":
+        base_url = args.api_url or os.environ.get("OBSIDIAN_REST_URL")
+        api_key = args.api_key or os.environ.get("OBSIDIAN_REST_API_KEY")
+        if not base_url or not api_key:
+            sys.exit(
+                "error: --backend rest requires an API URL and key. "
+                "Set OBSIDIAN_REST_URL and OBSIDIAN_REST_API_KEY (env vars), "
+                "or pass --api-url/--api-key."
+            )
+        return RestBackend(base_url, api_key, insecure=args.insecure)
+    if not args.vault:
+        sys.exit("error: --vault is required for --backend fs (the default)")
+    return FsBackend(Path(args.vault))
+
+
+# ------------------------------------------------------------- note I/O
+
+def write_note(backend, rel_path: str, frontmatter: dict, body: str) -> None:
     lines = ["---"]
     for k, v in frontmatter.items():
         if isinstance(v, list):
@@ -66,17 +204,15 @@ def write_note(path: Path, frontmatter: dict, body: str) -> None:
         elif v is None or v == "":
             lines.append(f"{k}:")
         else:
-            lines.append(f'{k}: {v}')
+            lines.append(f"{k}: {v}")
     lines.append("---")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n\n" + body.rstrip() + "\n", encoding="utf-8")
+    backend.write_text(rel_path, "\n".join(lines) + "\n\n" + body.rstrip() + "\n")
 
 
 FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
 
 
-def read_frontmatter(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8")
+def parse_frontmatter(text: str) -> dict:
     m = FM_RE.match(text)
     if not m:
         return {}
@@ -97,16 +233,49 @@ def read_frontmatter(path: Path) -> dict:
     return fm
 
 
+def read_frontmatter(backend, rel_path: str) -> dict:
+    text = backend.read_text(rel_path)
+    return parse_frontmatter(text) if text is not None else {}
+
+
+def unique_path(backend, dir_rel: str, stem: str, ext: str = ".md") -> str:
+    candidate = f"{dir_rel}/{stem}{ext}"
+    if not backend.exists(candidate):
+        return candidate
+    n = 2
+    while backend.exists(f"{dir_rel}/{stem} ({n}){ext}"):
+        n += 1
+    return f"{dir_rel}/{stem} ({n}){ext}"
+
+
+def load_state(backend) -> dict:
+    text = backend.read_text(f"{STATE_DIR}/{STATE_FILE}")
+    return json.loads(text) if text is not None else {"sessions": {}}
+
+
+def save_state(backend, state: dict) -> None:
+    backend.write_text(f"{STATE_DIR}/{STATE_FILE}", json.dumps(state, indent=2, sort_keys=True))
+
+
+# ------------------------------------------------------------- commands
+
+def cmd_check(args):
+    backend = make_backend(args)
+    ok, msg = backend.check()
+    print(json.dumps({"ok": ok, "backend": args.backend, "detail": msg}, indent=2))
+    if not ok:
+        sys.exit(1)
+
+
 def cmd_setup(args):
-    vault = Path(args.vault)
-    if not vault.is_dir():
-        sys.exit(f"error: vault path does not exist or is not a directory: {vault}")
-    for folder in FOLDERS:
-        (vault / folder).mkdir(parents=True, exist_ok=True)
-    load_state(vault)  # creates nothing yet, but validates we can write there
-    save_state(vault, load_state(vault))
-    rebuild_views(vault)
-    print(json.dumps({"ok": True, "vault": str(vault), "folders": FOLDERS}, indent=2))
+    backend = make_backend(args)
+    ok, msg = backend.check()
+    if not ok:
+        sys.exit(f"error: {msg}")
+    backend.ensure_dirs(FOLDERS)
+    save_state(backend, load_state(backend))
+    rebuild_views(backend)
+    print(json.dumps({"ok": True, "backend": args.backend, "folders": FOLDERS}, indent=2))
 
 
 def validate_task(t: dict, idx: int):
@@ -121,9 +290,11 @@ def validate_task(t: dict, idx: int):
 
 
 def cmd_sync_entry(args):
-    vault = Path(args.vault)
-    if not vault.is_dir():
-        sys.exit(f"error: vault path does not exist: {vault}")
+    backend = make_backend(args)
+    ok, msg = backend.check()
+    if not ok:
+        sys.exit(f"error: {msg}")
+
     payload = json.loads(Path(args.payload).read_text(encoding="utf-8"))
 
     for field in ("vocci_session_id", "date", "title", "project", "summary"):
@@ -139,7 +310,7 @@ def cmd_sync_entry(args):
         validate_task(t, i)
 
     session_id = payload["vocci_session_id"]
-    state = load_state(vault)
+    state = load_state(backend)
     existing = state["sessions"].get(session_id)
     if existing and not args.force:
         print(json.dumps({"ok": False, "skipped": True, "reason": "already synced",
@@ -148,22 +319,20 @@ def cmd_sync_entry(args):
     if existing and args.force:
         for rel in [existing.get("meeting_note")] + existing.get("task_notes", []):
             if rel:
-                p = vault / rel
-                if p.exists():
-                    p.unlink()
+                backend.delete(rel)
 
     project_name = sanitize(payload["project"])
-    project_path = vault / "Projects" / f"{project_name}.md"
-    if not project_path.exists():
+    project_rel = f"Projects/{project_name}.md"
+    if not backend.exists(project_rel):
         write_note(
-            project_path,
+            backend, project_rel,
             {"type": "project", "status": "active", "tags": ["project"]},
             f"# {project_name}\n\n*No description yet -- fill this in.*\n",
         )
 
     meeting_stem = sanitize(f"{payload['date']} - {payload['title']}")
-    meeting_path = unique_path(vault / "Meetings", meeting_stem)
-    meeting_title = meeting_path.stem
+    meeting_rel = unique_path(backend, "Meetings", meeting_stem)
+    meeting_title = stem_of(meeting_rel)
 
     task_notes = []
     task_lines = []
@@ -176,8 +345,8 @@ def cmd_sync_entry(args):
         context = t.get("context", "") or ""
 
         task_stem = sanitize(f"{payload['date']} - {desc}", maxlen=70)
-        task_path = unique_path(vault / "Tasks", task_stem)
-        task_title = task_path.stem
+        task_rel = unique_path(backend, "Tasks", task_stem)
+        task_title = stem_of(task_rel)
 
         body = (
             f"**Project:** [[{project_name}]]\n"
@@ -191,7 +360,7 @@ def cmd_sync_entry(args):
             body += f"\n> Context: \"{context}\"\n"
 
         write_note(
-            task_path,
+            backend, task_rel,
             {
                 "type": "task",
                 "status": status,
@@ -205,7 +374,7 @@ def cmd_sync_entry(args):
             },
             body,
         )
-        task_notes.append(str(task_path.relative_to(vault)))
+        task_notes.append(task_rel)
         task_lines.append(f"- [[{task_title}]] ({priority}, due {due or 'none'}) -- owner: {owner}")
 
     attendees = payload.get("attendees", [])
@@ -216,7 +385,7 @@ def cmd_sync_entry(args):
         f"## Action items\n\n" + ("\n".join(task_lines) if task_lines else "*None captured.*") + "\n"
     )
     write_note(
-        meeting_path,
+        backend, meeting_rel,
         {
             "type": "meeting",
             "date": payload["date"],
@@ -230,50 +399,47 @@ def cmd_sync_entry(args):
     )
 
     state["sessions"][session_id] = {
-        "meeting_note": str(meeting_path.relative_to(vault)),
+        "meeting_note": meeting_rel,
         "project": project_name,
         "task_notes": task_notes,
         "synced_at": datetime.utcnow().isoformat() + "Z",
     }
-    save_state(vault, state)
-    rebuild_views(vault)
+    save_state(backend, state)
+    rebuild_views(backend)
 
     print(json.dumps({
         "ok": True,
-        "meeting_note": str(meeting_path.relative_to(vault)),
-        "project_note": str(project_path.relative_to(vault)),
+        "meeting_note": meeting_rel,
+        "project_note": project_rel,
         "task_notes": task_notes,
     }, indent=2))
 
 
-def rebuild_views(vault: Path) -> None:
-    tasks, projects, meetings = [], [], []
-    for p in sorted((vault / "Tasks").glob("*.md")):
-        fm = read_frontmatter(p)
-        if fm.get("type") == "task":
-            fm["_name"] = p.stem
-            tasks.append(fm)
-    for p in sorted((vault / "Projects").glob("*.md")):
-        fm = read_frontmatter(p)
-        if fm.get("type") == "project":
-            fm["_name"] = p.stem
-            projects.append(fm)
-    for p in sorted((vault / "Meetings").glob("*.md")):
-        fm = read_frontmatter(p)
-        if fm.get("type") == "meeting":
-            fm["_name"] = p.stem
-            meetings.append(fm)
+def _load_typed(backend, dir_rel: str, type_name: str):
+    out = []
+    for rel in backend.list_md(dir_rel):
+        fm = read_frontmatter(backend, rel)
+        if fm.get("type") == type_name:
+            fm["_name"] = stem_of(rel)
+            out.append(fm)
+    return out
 
-    _write_upcoming_tasks(vault, tasks)
-    _write_project_status(vault, tasks, projects, meetings)
-    _write_meeting_log(vault, meetings, tasks)
+
+def rebuild_views(backend) -> None:
+    tasks = _load_typed(backend, "Tasks", "task")
+    projects = _load_typed(backend, "Projects", "project")
+    meetings = _load_typed(backend, "Meetings", "meeting")
+
+    _write_upcoming_tasks(backend, tasks)
+    _write_project_status(backend, tasks, projects, meetings)
+    _write_meeting_log(backend, meetings, tasks)
 
 
 def _sort_key_due(t):
-    return (t.get("due") or "9999-99-99")
+    return t.get("due") or "9999-99-99"
 
 
-def _write_upcoming_tasks(vault: Path, tasks):
+def _write_upcoming_tasks(backend, tasks):
     lines = ["# Upcoming Tasks", "", GENERATED_MARK, ""]
     open_tasks = [t for t in tasks if t.get("status") != "done"]
     for priority in PRIORITIES:
@@ -291,10 +457,10 @@ def _write_upcoming_tasks(vault: Path, tasks):
         else:
             lines.append("*None.*")
         lines.append("")
-    (vault / "Views" / "Upcoming Tasks.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    backend.write_text("Views/Upcoming Tasks.md", "\n".join(lines) + "\n")
 
 
-def _write_project_status(vault: Path, tasks, projects, meetings):
+def _write_project_status(backend, tasks, projects, meetings):
     lines = ["# Project Status", "", GENERATED_MARK, "", "| Project | Status | Open Tasks | High Priority Open | Meetings | Last Meeting |", "|---|---|---|---|---|---|"]
     known_names = {p["_name"] for p in projects}
     for name in sorted(known_names | {t.get("project", "") for t in tasks} | {m.get("project", "") for m in meetings}):
@@ -310,10 +476,10 @@ def _write_project_status(vault: Path, tasks, projects, meetings):
         lines.append(
             f"| [[{name}]] | {status} | {len(open_tasks)} | {len(high_open)} | {len(proj_meetings)} | {last_meeting} |"
         )
-    (vault / "Views" / "Project Status.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    backend.write_text("Views/Project Status.md", "\n".join(lines) + "\n")
 
 
-def _write_meeting_log(vault: Path, meetings, tasks):
+def _write_meeting_log(backend, meetings, tasks):
     lines = ["# Meeting Log", "", GENERATED_MARK, "", "| Date | Meeting | Project | Attendees | Tasks Created |", "|---|---|---|---|---|"]
     for m in sorted(meetings, key=lambda m: m.get("date", ""), reverse=True):
         n_tasks = len([t for t in tasks if t.get("source_meeting") == m["_name"]])
@@ -322,46 +488,49 @@ def _write_meeting_log(vault: Path, meetings, tasks):
         lines.append(
             f"| {m.get('date','')} | [[{m['_name']}]] | [[{m.get('project','')}]] | {attendees_str or 'unknown'} | {n_tasks} |"
         )
-    (vault / "Views" / "Meeting Log.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    backend.write_text("Views/Meeting Log.md", "\n".join(lines) + "\n")
 
 
 def cmd_rebuild_views(args):
-    vault = Path(args.vault)
-    if not vault.is_dir():
-        sys.exit(f"error: vault path does not exist: {vault}")
-    rebuild_views(vault)
+    backend = make_backend(args)
+    ok, msg = backend.check()
+    if not ok:
+        sys.exit(f"error: {msg}")
+    rebuild_views(backend)
     print(json.dumps({"ok": True}, indent=2))
 
 
 def cmd_status(args):
-    vault = Path(args.vault)
-    if not vault.is_dir():
-        sys.exit(f"error: vault path does not exist: {vault}")
-    state = load_state(vault)
-    print(json.dumps(state, indent=2))
+    backend = make_backend(args)
+    ok, msg = backend.check()
+    if not ok:
+        sys.exit(f"error: {msg}")
+    print(json.dumps(load_state(backend), indent=2))
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--backend", choices=["fs", "rest"], default="fs",
+                         help="fs = direct vault folder on this machine (default). rest = Obsidian Local REST API over HTTP.")
+    common.add_argument("--vault", help="Vault folder path (backend=fs)")
+    common.add_argument("--api-url", help="Local REST API base URL, e.g. https://your-tunnel.example.com (backend=rest; or set OBSIDIAN_REST_URL)")
+    common.add_argument("--api-key", help="Local REST API key (backend=rest; prefer the OBSIDIAN_REST_API_KEY env var over this flag)")
+    common.add_argument("--insecure", action="store_true",
+                         help="Skip TLS verification. Only for a direct self-signed https://127.0.0.1:27124 connection -- never use over a public tunnel.")
+
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("setup")
-    s.add_argument("--vault", required=True)
-    s.set_defaults(func=cmd_setup)
+    sub.add_parser("check", parents=[common]).set_defaults(func=cmd_check)
+    sub.add_parser("setup", parents=[common]).set_defaults(func=cmd_setup)
 
-    s = sub.add_parser("sync-entry")
-    s.add_argument("--vault", required=True)
+    s = sub.add_parser("sync-entry", parents=[common])
     s.add_argument("--payload", required=True)
     s.add_argument("--force", action="store_true")
     s.set_defaults(func=cmd_sync_entry)
 
-    s = sub.add_parser("rebuild-views")
-    s.add_argument("--vault", required=True)
-    s.set_defaults(func=cmd_rebuild_views)
-
-    s = sub.add_parser("status")
-    s.add_argument("--vault", required=True)
-    s.set_defaults(func=cmd_status)
+    sub.add_parser("rebuild-views", parents=[common]).set_defaults(func=cmd_rebuild_views)
+    sub.add_parser("status", parents=[common]).set_defaults(func=cmd_status)
 
     args = ap.parse_args()
     args.func(args)

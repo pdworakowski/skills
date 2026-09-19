@@ -1,6 +1,6 @@
 ---
 name: vocci-obsidian-meeting-sync
-description: Turn Vocci ring-captured meetings/conversations into a linked Obsidian vault of atomic Meeting, Task, and Project notes, with auto-refreshed Upcoming Tasks / Project Status / Meeting Log views. Use when the user wants Vocci meetings synced to Obsidian, an Obsidian "second brain" fed from Vocci recordings, action items pulled out of meetings and tracked in Obsidian, or asks to sync/import/export Vocci sessions into a notes vault. Requires no Obsidian plugins (Dataview/Bases optional upgrades) — every conversation gets a project and a priority, deterministically.
+description: Turn Vocci ring-captured meetings/conversations into a linked Obsidian vault of atomic Meeting, Task, and Project notes, with auto-refreshed Upcoming Tasks / Project Status / Meeting Log views. Use when the user wants Vocci meetings synced to Obsidian, an Obsidian "second brain" fed from Vocci recordings, action items pulled out of meetings and tracked in Obsidian, or asks to sync/import/export Vocci sessions into a notes vault — including from a remote/cloud Claude session with no local filesystem access to the vault (via the Obsidian Local REST API backend). Requires no Obsidian plugins for the local path (Dataview/Bases optional upgrades) — every conversation gets a project and a priority, deterministically.
 ---
 
 # Vocci → Obsidian meeting sync
@@ -36,25 +36,66 @@ correctly in a stock Obsidian install — no community plugin required. See
 "Optional: live queries instead" below if the user has Dataview or Bases and
 wants live queries instead of the regenerated snapshot.
 
-## Step 0 — find the vault, run setup once
+## Step -1 — pick a backend
 
-Ask the user for their Obsidian vault path if it isn't obvious from context
-(check for a `.obsidian/` folder to confirm it's really a vault). Then:
+`scripts/vault_sync.py` has two backends behind the same commands and
+payload shape. Pick based on whether *this* Claude session can see the
+vault on disk:
+
+- **`--backend fs`** (default) — direct filesystem writes. Use when Claude
+  is running on the same machine as the vault (a local Claude Code
+  session). Needs only `--vault /path/to/Vault`.
+- **`--backend rest`** — writes over the Obsidian **Local REST API**
+  community plugin's HTTP API instead. Use whenever this session is remote
+  (a cloud/web Claude session, or any machine other than the one holding
+  the vault) — the whole point is it doesn't need local disk access.
+  Needs `OBSIDIAN_REST_URL` and `OBSIDIAN_REST_API_KEY` (env vars — don't
+  pass the key as a bare CLI flag if you can avoid it, it'll land in shell
+  history). If neither is set and the user hasn't said "local", ask which
+  they want rather than assuming.
+
+**One-time setup for `rest`, done by the user on their own machine** (you
+can't do this part remotely — walk them through it, don't attempt it
+yourself):
+1. Install and enable the **Local REST API** community plugin in Obsidian; copy the API key it generates.
+2. Expose it off the local machine with a tunnel that terminates real TLS — e.g. `cloudflared tunnel --url http://127.0.0.1:27123` or `ngrok http 27123` — pointed at the plugin's **plain HTTP** port (27123), not its self-signed HTTPS port (27124). Point the tunnel at the plugin's port, not at any other local service.
+3. They give you the resulting `https://...` tunnel URL and the API key.
+
+Before anything else, verify the connection:
 
 ```bash
-python3 scripts/vault_sync.py setup --vault "/path/to/Vault"
+OBSIDIAN_REST_URL="https://<tunnel-url>" OBSIDIAN_REST_API_KEY="<key>" \
+  python3 scripts/vault_sync.py check --backend rest
 ```
 
-Idempotent — safe to run again later. Creates `Meetings/`, `Tasks/`,
-`Projects/`, `Views/`, and the sync-state file if any are missing. Never
-touches existing notes.
+`{"ok": false, ...}` with a 401 means a bad key; a "could not reach" error
+means the tunnel isn't up — report the specific failure back to the user
+rather than retrying blindly, they'll need to fix it on their end.
+
+(The plugin's exact response shapes are assumed from its long-stable core
+endpoints — GET/PUT/DELETE on `/vault/{path}`, GET on `/vault/{dir}/` for a
+listing — but `check` is what actually proves it against their install
+before you write anything.)
+
+## Step 0 — run setup once
+
+```bash
+python3 scripts/vault_sync.py setup --vault "/path/to/Vault"          # fs
+python3 scripts/vault_sync.py setup --backend rest                    # rest (env vars set)
+```
+
+Idempotent — safe to run again later. For `fs`, creates `Meetings/`,
+`Tasks/`, `Projects/`, `Views/`, and the sync-state file if any are
+missing. For `rest`, folders appear automatically as notes get written
+into them, so this mainly re-verifies the connection and seeds the
+sync-state file. Never touches existing notes either way.
 
 ## Step 1 — find which Vocci sessions to sync
 
 Check what's already synced so you don't reprocess it:
 
 ```bash
-python3 scripts/vault_sync.py status --vault "/path/to/Vault"
+python3 scripts/vault_sync.py status --vault "/path/to/Vault"    # or --backend rest
 ```
 
 Then list candidate sessions:
@@ -123,7 +164,8 @@ with zero action items (that's what makes the Meeting Log complete, per
 "every captured conversation entry is categorized").
 
 ```bash
-python3 scripts/vault_sync.py sync-entry --vault "/path/to/Vault" --payload /tmp/entry.json
+python3 scripts/vault_sync.py sync-entry --vault "/path/to/Vault" --payload /tmp/entry.json   # fs
+python3 scripts/vault_sync.py sync-entry --backend rest --payload /tmp/entry.json             # rest (env vars set)
 ```
 
 The script validates `priority`/`status`/required fields itself and exits
@@ -174,8 +216,10 @@ written.
 
 ## Notes / failure modes
 
-- **Vault path wrong or not a vault** → `setup`/`sync-entry` fail fast with a clear error; don't guess a path, ask the user.
-- **Duplicate sync** → handled by `.vocci-sync/state.json`; don't try to dedupe by scanning filenames yourself.
+- **Vault path wrong or not a vault** (`fs`) → `setup`/`sync-entry` fail fast with a clear error; don't guess a path, ask the user.
+- **Tunnel down or bad API key** (`rest`) → `check` fails fast with which one it is; report it, don't retry blindly — it needs the user to fix something on their machine.
+- **Duplicate sync** → handled by `.vocci-sync/state.json` (read/written through whichever backend you picked); don't try to dedupe by scanning filenames yourself.
 - **Long transcripts** → page with `eventsCursor`; don't extract from a page you haven't confirmed is complete (`truncated: false` and no `eventsNextCursor`).
 - **Ambiguous owner/attendee** → use `"UNKNOWN"` / leave attendees empty rather than guessing from a speaker label; say so in your report if it affects several tasks.
 - **No action items in a meeting** → still sync it (`tasks: []`) so the Meeting Log stays complete.
+- **Never log or echo `OBSIDIAN_REST_API_KEY`** in output, commit messages, or anywhere outside the command that needs it.
