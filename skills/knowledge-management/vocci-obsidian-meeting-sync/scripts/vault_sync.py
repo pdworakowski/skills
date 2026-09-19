@@ -278,6 +278,22 @@ def cmd_setup(args):
     print(json.dumps({"ok": True, "backend": args.backend, "folders": FOLDERS}, indent=2))
 
 
+def post_webhook(url: str, payload: dict) -> dict:
+    """Best-effort POST of a sync summary to an automation tool (e.g. an n8n
+    Webhook trigger). Never raises -- the vault write already succeeded by
+    the time this runs, so a dead webhook must not look like a failed sync;
+    its outcome is reported back in the result JSON instead."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return {"delivered": True, "status": resp.status}
+    except urllib.error.HTTPError as e:
+        return {"delivered": False, "status": e.code, "error": e.read().decode("utf-8", errors="replace")[:300]}
+    except urllib.error.URLError as e:
+        return {"delivered": False, "error": str(e.reason)}
+
+
 def validate_task(t: dict, idx: int):
     if not t.get("description", "").strip():
         sys.exit(f"error: tasks[{idx}] missing non-empty 'description'")
@@ -323,7 +339,8 @@ def cmd_sync_entry(args):
 
     project_name = sanitize(payload["project"])
     project_rel = f"Projects/{project_name}.md"
-    if not backend.exists(project_rel):
+    project_is_new = not backend.exists(project_rel)
+    if project_is_new:
         write_note(
             backend, project_rel,
             {"type": "project", "status": "active", "tags": ["project"]},
@@ -336,6 +353,7 @@ def cmd_sync_entry(args):
 
     task_notes = []
     task_lines = []
+    task_details = []
     for t in tasks:
         desc = t["description"].strip()
         priority = t.get("priority", "medium").lower()
@@ -376,6 +394,16 @@ def cmd_sync_entry(args):
         )
         task_notes.append(task_rel)
         task_lines.append(f"- [[{task_title}]] ({priority}, due {due or 'none'}) -- owner: {owner}")
+        task_details.append({
+            "path": task_rel,
+            "title": task_title,
+            "description": desc,
+            "priority": priority,
+            "status": status,
+            "due": due,
+            "owner": owner,
+            "context": context,
+        })
 
     attendees = payload.get("attendees", [])
     meeting_body = (
@@ -398,21 +426,43 @@ def cmd_sync_entry(args):
         meeting_body,
     )
 
+    synced_at = datetime.utcnow().isoformat() + "Z"
     state["sessions"][session_id] = {
         "meeting_note": meeting_rel,
         "project": project_name,
         "task_notes": task_notes,
-        "synced_at": datetime.utcnow().isoformat() + "Z",
+        "synced_at": synced_at,
     }
     save_state(backend, state)
     rebuild_views(backend)
 
-    print(json.dumps({
+    result = {
         "ok": True,
         "meeting_note": meeting_rel,
         "project_note": project_rel,
+        "project_is_new": project_is_new,
         "task_notes": task_notes,
-    }, indent=2))
+    }
+
+    webhook_url = args.webhook_url or os.environ.get("N8N_WEBHOOK_URL")
+    if webhook_url:
+        webhook_payload = {
+            "event": "vocci_meeting_synced",
+            "synced_at": synced_at,
+            "vocci_session_id": session_id,
+            "meeting": {
+                "path": meeting_rel,
+                "title": meeting_title,
+                "date": payload["date"],
+                "attendees": attendees,
+                "summary": payload["summary"].strip(),
+            },
+            "project": {"name": project_name, "path": project_rel, "is_new": project_is_new},
+            "tasks": task_details,
+        }
+        result["webhook"] = post_webhook(webhook_url, webhook_payload)
+
+    print(json.dumps(result, indent=2))
 
 
 def _load_typed(backend, dir_rel: str, type_name: str):
@@ -527,6 +577,7 @@ def main():
     s = sub.add_parser("sync-entry", parents=[common])
     s.add_argument("--payload", required=True)
     s.add_argument("--force", action="store_true")
+    s.add_argument("--webhook-url", help="POST a JSON sync summary here after a successful sync (e.g. an n8n Webhook trigger URL). Or set N8N_WEBHOOK_URL. Optional -- skipped if neither is set.")
     s.set_defaults(func=cmd_sync_entry)
 
     sub.add_parser("rebuild-views", parents=[common]).set_defaults(func=cmd_rebuild_views)

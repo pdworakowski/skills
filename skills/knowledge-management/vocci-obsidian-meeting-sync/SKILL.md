@@ -1,6 +1,6 @@
 ---
 name: vocci-obsidian-meeting-sync
-description: Turn Vocci ring-captured meetings/conversations into a linked Obsidian vault of atomic Meeting, Task, and Project notes, with auto-refreshed Upcoming Tasks / Project Status / Meeting Log views. Use when the user wants Vocci meetings synced to Obsidian, an Obsidian "second brain" fed from Vocci recordings, action items pulled out of meetings and tracked in Obsidian, or asks to sync/import/export Vocci sessions into a notes vault — including from a remote/cloud Claude session with no local filesystem access to the vault (via the Obsidian Local REST API backend). Requires no Obsidian plugins for the local path (Dataview/Bases optional upgrades) — every conversation gets a project and a priority, deterministically.
+description: Turn Vocci ring-captured meetings/conversations into a linked Obsidian vault of atomic Meeting, Task, and Project notes, with auto-refreshed Upcoming Tasks / Project Status / Meeting Log views. Use when the user wants Vocci meetings synced to Obsidian, an Obsidian "second brain" fed from Vocci recordings, action items pulled out of meetings and tracked in Obsidian, or asks to sync/import/export Vocci sessions into a notes vault — including from a remote/cloud Claude session with no local filesystem access to the vault (via the Obsidian Local REST API backend). Also covers chaining downstream automation off each sync (n8n/Zapier/Make webhooks — e.g. push high-priority tasks to Todoist, post meeting digests to Slack, mirror tasks into Notion/Airtable). Requires no Obsidian plugins for the local path (Dataview/Bases optional upgrades) — every conversation gets a project and a priority, deterministically.
 ---
 
 # Vocci → Obsidian meeting sync
@@ -186,6 +186,63 @@ Tell the user, per session: the meeting note path, how many tasks were
 created and at what priorities, and which project it landed under (flag it
 clearly if you used `"Unsorted"` so they know to reclassify). Point them at
 `Views/Upcoming Tasks.md` and `Views/Project Status.md` for the roll-up.
+
+## Downstream automation (n8n, Zapier, Make, ...)
+
+`sync-entry` can POST a JSON summary to an automation tool's webhook right
+after a successful sync, so the vault isn't a dead end — the same sync that
+writes the notes can also kick off "create a Todoist task," "post a Slack
+digest," "mirror this row into Notion," etc. It's push-based (fires once,
+with structured data, the moment real action items exist) rather than
+making the automation tool poll and re-parse Markdown.
+
+```bash
+python3 scripts/vault_sync.py sync-entry --vault "/path/to/Vault" \
+  --payload /tmp/entry.json --webhook-url "https://<n8n-host>/webhook/vocci-sync"
+# or: export N8N_WEBHOOK_URL="https://<n8n-host>/webhook/vocci-sync"
+```
+
+Optional — omit it and nothing changes. Delivery is best-effort: a dead or
+misconfigured webhook is reported in the result (`"webhook": {"delivered":
+false, "error": ...}`) but never fails the sync or blocks the vault write,
+since the notes are already safely written by the time it fires. Relay that
+`webhook.delivered: false` to the user rather than silently swallowing it —
+their vault is fine, but the downstream automation didn't run. It never
+fires on a skipped (already-synced) session.
+
+Payload POSTed (`Content-Type: application/json`):
+
+```json
+{
+  "event": "vocci_meeting_synced",
+  "synced_at": "2026-09-19T23:45:51Z",
+  "vocci_session_id": "sess_123",
+  "meeting": {"path": "Meetings/....md", "title": "...", "date": "2026-09-19", "attendees": ["Alice"], "summary": "..."},
+  "project": {"name": "Website Relaunch", "path": "Projects/Website Relaunch.md", "is_new": true},
+  "tasks": [
+    {"path": "Tasks/....md", "title": "...", "description": "...", "priority": "high", "status": "open", "due": "2026-09-22", "owner": "Alice", "context": "..."}
+  ]
+}
+```
+
+That's the whole contract — build the n8n (or Zapier/Make) workflow against
+it: a **Webhook** trigger node receiving this JSON, then branch on
+`tasks[].priority` (e.g. `high` → create a Todoist/Asana/Linear task with
+`due`) and on the `event`/`meeting` fields (→ post `meeting.summary` to
+Slack/Discord/email; mirror each task into a Notion/Airtable/Sheets row
+keyed by `project.name`). Don't hand-build the n8n workflow JSON blind —
+node parameter schemas drift across n8n versions and a wrong one fails to
+import silently; once the user actually has an n8n instance and has picked
+which apps (Todoist vs. Asana, Slack vs. email, Notion vs. Airtable, ...),
+build/import the workflow against that real instance instead of guessing
+its JSON export format here.
+
+If the automation side needs to *read* the vault too (not just react to
+this webhook) — e.g. a nightly digest, or reacting to notes edited by hand
+in Obsidian rather than through this skill — point it at the same `rest`
+backend's Local REST API instead of re-implementing vault access: same
+tunnel, same API key, it can `GET /vault/Tasks/` on a schedule the same way
+this script's `RestBackend` does.
 
 ## Optional: live queries instead of static views
 
