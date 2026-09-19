@@ -19,3 +19,4 @@ use it.
 - `skills/research-and-web/` — Finding and pulling information from the web, research APIs, browsers, and YouTube.
 - `skills/thinking-and-docs/` — Structured thinking, interviewing, teaching, and turning ideas into clear documentation.
 - `skills/ops-and-setup/` — Machine, server, security, and tool setup, configuration, and operations.
+- `skills/knowledge-management/` — Turning captured conversations and notes into structured, linked knowledge bases (e.g. syncing Vocci meetings into an Obsidian vault).
