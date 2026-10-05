@@ -63,6 +63,7 @@ INBOX_DIR = "00_Inbox/Vocci"
 FOLDERS = [INBOX_DIR, "Meetings", "Tasks", "Projects", "Views"]
 PRIORITIES = ["high", "medium", "low"]
 STATUSES = ["open", "in-progress", "done"]
+ENERGIES = ["deep", "medium", "low"]
 SCOPES = ["private", "work"]
 CLASSIFICATIONS = ["public", "internal", "confidential", "restricted"]
 RETENTION_RE = re.compile(r"^delete-after-\d+d$")
@@ -389,6 +390,9 @@ def validate_task(t: dict, idx: int):
     status = t.get("status", "open").lower()
     if status not in STATUSES:
         sys.exit(f"error: tasks[{idx}] status must be one of {STATUSES}, got {t.get('status')!r}")
+    energy = t.get("energy", "")
+    if energy and energy.lower() not in ENERGIES:
+        sys.exit(f"error: tasks[{idx}] energy must be empty or one of {ENERGIES}, got {t.get('energy')!r}")
 
 
 def validate_retention(value: str):
@@ -567,6 +571,7 @@ def _promote_one(backend, state, session_id, args, webhook_url):
         due = t.get("due", "") or ""
         owner = t.get("owner", "") or "UNKNOWN"
         context = t.get("context", "") or ""
+        energy = (t.get("energy", "") or "").lower()
 
         task_stem = sanitize(f"{payload['date']} - {desc}", maxlen=70)
         task_rel = unique_path(backend, "Tasks", task_stem)
@@ -577,7 +582,8 @@ def _promote_one(backend, state, session_id, args, webhook_url):
             f"**From meeting:** [[{meeting_title}]]\n"
             f"**Owner:** {owner}\n"
             f"**Due:** {due or 'none'}\n"
-            f"**Priority:** {priority}\n\n"
+            f"**Priority:** {priority}\n"
+            f"**Energy:** {energy or 'unspecified'}\n\n"
             f"{desc}\n"
         )
         if context:
@@ -592,6 +598,7 @@ def _promote_one(backend, state, session_id, args, webhook_url):
                 "project": project_name,
                 "due": due,
                 "owner": owner,
+                "energy": energy,
                 "source_meeting": meeting_title,
                 "vocci_session_id": session_id,
                 "scope": scope,
@@ -604,7 +611,7 @@ def _promote_one(backend, state, session_id, args, webhook_url):
         task_lines.append(f"- [[{task_title}]] ({priority}, due {due or 'none'}) -- owner: {owner}")
         task_details.append({
             "path": task_rel, "title": task_title, "description": desc, "priority": priority,
-            "status": status, "due": due, "owner": owner, "context": context,
+            "status": status, "due": due, "owner": owner, "energy": energy, "context": context,
         })
 
     attendees = payload.get("attendees", [])
@@ -733,10 +740,47 @@ def rebuild_views(backend) -> None:
     _write_upcoming_tasks(backend, tasks)
     _write_project_status(backend, tasks, projects, meetings)
     _write_meeting_log(backend, meetings, tasks)
+    _write_right_now(backend, tasks)
 
 
 def _sort_key_due(t):
     return t.get("due") or "9999-99-99"
+
+
+def _sort_key_priority_due(t):
+    rank = {"high": 0, "medium": 1, "low": 2}
+    return (rank.get(t.get("priority"), 1), _sort_key_due(t))
+
+
+def _best_task_for_energy(open_tasks, energy):
+    # Unspecified-energy tasks are flexible -- eligible for any tier. A task
+    # explicitly tagged a different energy never gets recommended under the
+    # wrong one.
+    candidates = [t for t in open_tasks if t.get("energy", "") in (energy, "")]
+    if not candidates:
+        return None
+    return sorted(candidates, key=_sort_key_priority_due)[0]
+
+
+def _write_right_now(backend, tasks):
+    open_tasks = [t for t in tasks if t.get("status") != "done"]
+    lines = [
+        "# Right Now", "", GENERATED_MARK, "",
+        "*One task per energy level, not a list -- pick the row that matches how you feel right now.*", "",
+    ]
+    for energy in ENERGIES:
+        best = _best_task_for_energy(open_tasks, energy)
+        lines.append(f"## {energy.capitalize()} energy")
+        lines.append("")
+        if best:
+            lines.append(
+                f"[[{best['_name']}]] — {best.get('priority','')} priority, due {best.get('due') or 'none'}, "
+                f"project [[{best.get('project','')}]]"
+            )
+        else:
+            lines.append("*Nothing matches — check Upcoming Tasks.md.*")
+        lines.append("")
+    backend.write_text("Views/Right Now.md", "\n".join(lines) + "\n")
 
 
 def _write_upcoming_tasks(backend, tasks):

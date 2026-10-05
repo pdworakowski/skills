@@ -42,6 +42,7 @@ counts; silently chaining capture → promote does not.
   Views/Upcoming Tasks.md      # regenerated on every promote; Inbox drafts never appear here
   Views/Project Status.md      # regenerated on every promote
   Views/Meeting Log.md         # regenerated on every promote
+  Views/Right Now.md           # regenerated on every promote -- one task per energy level, not a list
   .vocci-sync/state.json       # session_id -> status/files, for dedup
   .vocci-sync/vault_scope.json # this vault's locked scope (private|work)
   .vocci-sync/pending/*.json   # cached payloads for captured-but-not-yet-promoted sessions
@@ -161,7 +162,7 @@ From the transcript + the session's own summary/notes, extract:
   - `public`: fine either way.
   - For the private vault, use your judgment the same way — health/family/finances lean `restricted` or `confidential`, general notes/ideas lean `internal`/`public`.
 - **Retention** — `"review"` (default), `"keep"`, or `"delete-after-Nd"` (e.g. `delete-after-90d`) if the raw content is time-sensitive and shouldn't be kept indefinitely once summarized.
-- **Action items** — concrete, owned follow-up work, not general discussion. For each: `description` (imperative, one line), `owner` (or `"UNKNOWN"` — same rule as attendees, don't infer identity from a bare speaker label), `due` (resolve relative dates like "by Friday" to `YYYY-MM-DD`, or `""` if none stated — don't invent one), `priority` (`high`/`medium`/`low` — `high` for a near-term deadline or urgency language, `low` for no deadline + explicitly optional framing, `medium` otherwise), `context` (a short verbatim quote backing it up).
+- **Action items** — concrete, owned follow-up work, not general discussion. For each: `description` (imperative, one line), `owner` (or `"UNKNOWN"` — same rule as attendees, don't infer identity from a bare speaker label), `due` (resolve relative dates like "by Friday" to `YYYY-MM-DD`, or `""` if none stated — don't invent one), `priority` (`high`/`medium`/`low` — `high` for a near-term deadline or urgency language, `low` for no deadline + explicitly optional framing, `medium` otherwise), `context` (a short verbatim quote backing it up), `energy` (optional — `deep`/`medium`/`low`, how much focus the task itself takes to execute, not how urgent it is; leave `""` if you can't tell from the transcript, the user can always set it later by hand-editing the task note's frontmatter and re-running `rebuild-views`).
 - **Summary** — a few sentences for the note body.
 
 ## Step 3 — capture (draft, not durable yet)
@@ -234,6 +235,14 @@ project — flag `"Unsorted"` clearly) or rejected, and point the user at
 `Views/Upcoming Tasks.md` / `Views/Project Status.md` for the roll-up.
 Anything still sitting in `list-pending` is unfinished business — mention
 it rather than letting it go stale silently.
+
+`Views/Right Now.md` is a different kind of view, aimed at ADHD-style
+"what do I do" paralysis specifically — it's not a list. It picks the
+single best open task per energy tier (`deep`/`medium`/`low`: highest
+priority, then soonest due; a task with no `energy` set is eligible for
+any tier, a task tagged a specific energy never gets recommended under a
+different one). Point the user at this instead of `Upcoming Tasks.md` when
+the ask is "what should I actually do right now," not "show me everything."
 
 ## Downstream automation (n8n, Zapier, Make, ...)
 
